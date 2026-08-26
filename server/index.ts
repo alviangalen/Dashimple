@@ -1,0 +1,336 @@
+import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { WebSocketServer, WebSocket } from 'ws';
+import si from 'systeminformation';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const DIST_DIR = path.resolve(__dirname, '../dist');
+
+export interface ServerData {
+  os: string;
+  hostname: string;
+  processor: string;
+  processorCores: number;
+  ramTotal: number;
+  uptime: number;
+  cpu: number;
+  ram: number;
+  ramUsed: number;
+  disks: { name: string; mountpoint: string; total: number; used: number; percent: number }[];
+  network: { rx: number; tx: number; rxTotal: number; txTotal: number };
+  docker: {
+    running: number;
+    stopped: number;
+    total: number;
+    containers: { name: string; image: string; status: 'running' | 'stopped' | 'paused'; cpu: number; mem: number }[];
+  };
+}
+
+let latestData: ServerData | null = null;
+let staticInfo: { os: string; hostname: string; processor: string; processorCores: number; ramTotal: number } | null = null;
+
+async function getStaticInfo() {
+  if (staticInfo) return staticInfo;
+  try {
+    const [osInfo, cpu, mem] = await Promise.all([
+      si.osInfo(),
+      si.cpu(),
+      si.mem(),
+    ]);
+
+    const distro = osInfo.distro && osInfo.distro !== 'unknown' ? osInfo.distro : osInfo.platform;
+    const release = osInfo.release || '';
+    const osString = `${distro} ${release}`.trim() || 'Linux';
+
+    const processor = [cpu.manufacturer, cpu.brand].filter(Boolean).join(' ') || 'Standard CPU';
+    const processorCores = cpu.cores || cpu.physicalCores || 1;
+    const ramTotal = Math.round((mem.total / (1024 * 1024 * 1024)) * 10) / 10;
+
+    staticInfo = {
+      os: osString,
+      hostname: osInfo.hostname || 'localhost',
+      processor,
+      processorCores,
+      ramTotal,
+    };
+  } catch (err) {
+    console.error('Error fetching static system info:', err);
+    staticInfo = {
+      os: 'Linux',
+      hostname: 'localhost',
+      processor: 'Generic CPU',
+      processorCores: 4,
+      ramTotal: 16,
+    };
+  }
+  return staticInfo;
+}
+
+async function collectMetrics(): Promise<ServerData> {
+  const info = await getStaticInfo();
+
+  const [currentLoad, mem, fsSize, netStats, timeInfo] = await Promise.all([
+    si.currentLoad().catch(() => ({ currentLoad: 0 })),
+    si.mem().catch(() => ({ total: 1, active: 0, used: 0, buffcache: 0 })),
+    si.fsSize().catch(() => []),
+    si.networkStats().catch(() => []),
+    si.time(),
+  ]);
+
+  // CPU
+  const cpu = Math.max(0, Math.min(100, Math.round((currentLoad.currentLoad || 0) * 10) / 10));
+
+  // RAM
+  const ramTotal = info.ramTotal;
+  const activeMem = mem.active || (mem.used - (mem.buffcache || 0)) || mem.used || 0;
+  const ramUsed = Math.round((activeMem / (1024 * 1024 * 1024)) * 100) / 100;
+  const ram = Math.max(0, Math.min(100, Math.round((activeMem / (mem.total || 1)) * 1000) / 10));
+
+  // Disks
+  const filteredDisks = fsSize.filter(d => {
+    if (!d.size || d.size <= 0) return false;
+    const m = d.mount.toLowerCase();
+    if (m.startsWith('/sys') || m.startsWith('/proc') || m.startsWith('/dev') || m.startsWith('/run')) return false;
+    if (m.startsWith('/usr/lib') || m.startsWith('/mnt/wslg') || m.includes('docker/overlay') || m.includes('containerd')) return false;
+    if (d.type === 'tmpfs' || d.type === 'devtmpfs' || d.type === 'squashfs') return false;
+    return true;
+  });
+
+  const diskList = filteredDisks.length > 0 ? filteredDisks : fsSize.filter(d => d.size > 0);
+  const disks = diskList.map(d => {
+    let name = d.fs.replace('/dev/', '');
+    if (d.mount === '/') {
+      name = 'root';
+    } else if (d.mount.startsWith('/mnt/') && d.mount.length === 6) {
+      name = `${d.mount.slice(5).toUpperCase()}:`;
+    }
+    const total = Math.round((d.size / (1024 * 1024 * 1024)) * 10) / 10;
+    const used = Math.round((d.used / (1024 * 1024 * 1024)) * 10) / 10;
+    const percent = Math.round((d.use || (total > 0 ? (used / total) * 100 : 0)) * 10) / 10;
+    return {
+      name,
+      mountpoint: d.mount,
+      total,
+      used,
+      percent,
+    };
+  });
+
+  // Network
+  let rxSecTotal = 0;
+  let txSecTotal = 0;
+  let rxBytesTotal = 0;
+  let txBytesTotal = 0;
+
+  if (Array.isArray(netStats) && netStats.length > 0) {
+    for (const iface of netStats) {
+      if (iface.operstate === 'up' || (iface.rx_sec || 0) > 0 || (iface.tx_sec || 0) > 0 || (iface.rx_bytes || 0) > 0) {
+        rxSecTotal += Math.max(0, iface.rx_sec || 0);
+        txSecTotal += Math.max(0, iface.tx_sec || 0);
+        rxBytesTotal += Math.max(0, iface.rx_bytes || 0);
+        txBytesTotal += Math.max(0, iface.tx_bytes || 0);
+      }
+    }
+  }
+
+  const rx = Math.round((rxSecTotal / (1024 * 1024)) * 100) / 100;
+  const tx = Math.round((txSecTotal / (1024 * 1024)) * 100) / 100;
+  const rxTotal = Math.round((rxBytesTotal / (1024 * 1024 * 1024)) * 1000) / 1000;
+  const txTotal = Math.round((txBytesTotal / (1024 * 1024 * 1024)) * 1000) / 1000;
+
+  // Docker
+  let dockerData = {
+    running: 0,
+    stopped: 0,
+    total: 0,
+    containers: [] as { name: string; image: string; status: 'running' | 'stopped' | 'paused'; cpu: number; mem: number }[],
+  };
+
+  try {
+    const [containers, stats] = await Promise.all([
+      si.dockerContainers(true).catch(() => []),
+      si.dockerContainerStats('*').catch(() => []),
+    ]);
+
+    if (Array.isArray(containers) && containers.length > 0) {
+      const statsMap = new Map<string, any>();
+      if (Array.isArray(stats)) {
+        for (const s of stats) {
+          statsMap.set(s.id, s);
+          statsMap.set(s.name, s);
+        }
+      }
+
+      let running = 0;
+      let stopped = 0;
+      const mappedContainers = containers.map(c => {
+        const isRunning = c.state === 'running' || c.state === 'restarting';
+        if (isRunning) running++;
+        else stopped++;
+
+        const stat = statsMap.get(c.id) || statsMap.get(c.name);
+        const cpuPercent = stat ? Math.round((stat.cpuPercent || 0) * 10) / 10 : 0;
+        const memMB = stat ? Math.round((stat.memUsage || 0) / (1024 * 1024)) : 0;
+
+        return {
+          name: c.name.replace(/^\//, ''),
+          image: c.image,
+          status: (c.state === 'running' ? 'running' : c.state === 'paused' ? 'paused' : 'stopped') as 'running' | 'stopped' | 'paused',
+          cpu: cpuPercent,
+          mem: memMB,
+        };
+      });
+
+      dockerData = {
+        running,
+        stopped,
+        total: containers.length,
+        containers: mappedContainers,
+      };
+    }
+  } catch {
+    // Docker daemon not active
+  }
+
+  const result: ServerData = {
+    os: info.os,
+    hostname: info.hostname,
+    processor: info.processor,
+    processorCores: info.processorCores,
+    ramTotal,
+    uptime: Math.floor(timeInfo.uptime || process.uptime()),
+    cpu,
+    ram,
+    ramUsed,
+    disks: disks.length > 0 ? disks : [{ name: 'root', mountpoint: '/', total: 50, used: 20, percent: 40 }],
+    network: {
+      rx,
+      tx,
+      rxTotal,
+      txTotal,
+    },
+    docker: dockerData,
+  };
+
+  latestData = result;
+  return result;
+}
+
+// MIME types for static file serving
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html',
+  '.js': 'text/javascript',
+  '.css': 'text/css',
+  '.json': 'application/json',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+};
+
+const PORT = parseInt(process.env.PORT || '1945', 10);
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
+  const hostHeader = req.headers.host || `localhost:${PORT}`;
+  const url = new URL(req.url || '/', `http://${hostHeader}`);
+
+  if (url.pathname === '/api/stats') {
+    try {
+      const data = latestData || (await collectMetrics());
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err?.message || 'Failed to collect metrics' }));
+    }
+    return;
+  }
+
+  if (url.pathname === '/api/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', uptime: process.uptime() }));
+    return;
+  }
+
+  if (fs.existsSync(DIST_DIR)) {
+    let filePath = path.join(DIST_DIR, url.pathname);
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isDirectory()) {
+      filePath = path.join(filePath, 'index.html');
+    }
+
+    if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+      const ext = path.extname(filePath).toLowerCase();
+      const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+      res.writeHead(200, { 'Content-Type': contentType });
+      fs.createReadStream(filePath).pipe(res);
+      return;
+    }
+
+    const indexPath = path.join(DIST_DIR, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      fs.createReadStream(indexPath).pipe(res);
+      return;
+    }
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Dashimple API Server - Not Found');
+});
+
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+wss.on('connection', async (ws: WebSocket) => {
+  try {
+    const initial = latestData || (await collectMetrics());
+    ws.send(JSON.stringify(initial));
+  } catch (err) {
+    console.error('Failed to send initial metrics to WS client:', err);
+  }
+
+  ws.on('error', (err) => {
+    console.error('WebSocket client error:', err);
+  });
+});
+
+function broadcast(data: ServerData) {
+  const payload = JSON.stringify(data);
+  for (const client of wss.clients) {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(payload);
+    }
+  }
+}
+
+const POLL_INTERVAL_MS = 2000;
+async function loop() {
+  try {
+    const data = await collectMetrics();
+    broadcast(data);
+  } catch (err) {
+    console.error('Error in metrics collection cycle:', err);
+  } finally {
+    setTimeout(loop, POLL_INTERVAL_MS);
+  }
+}
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[Dashimple Server] Running on http://0.0.0.0:${PORT}`);
+  console.log(`[Dashimple Server] WebSocket endpoint ws://0.0.0.0:${PORT}/ws`);
+  loop();
+});

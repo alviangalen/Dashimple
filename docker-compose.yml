@@ -1,0 +1,15 @@
+services:
+  dashimple:
+    build: .
+    container_name: dashimple
+    restart: unless-stopped
+    ports:
+      - "1945:1945"
+    environment:
+      - PORT=1945
+      - NODE_ENV=production
+    volumes:
+      # Akses Docker daemon host untuk monitoring container real-time
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Izinkan container membaca metrik proses host (opsional untuk Linux server)
+    pid: host
