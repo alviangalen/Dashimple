@@ -4,7 +4,7 @@ FROM node:22-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 
 COPY . .
 RUN npm run build
@@ -18,7 +18,7 @@ ENV NODE_ENV=production
 ENV PORT=1945
 
 COPY package*.json ./
-RUN npm ci --omit=dev && npm install -g tsx
+RUN npm install --omit=dev && npm install -g tsx
 
 COPY --from=builder /app/dist ./dist
 COPY server ./server
