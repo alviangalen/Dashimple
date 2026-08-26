@@ -1,0 +1,23 @@
+name: Deploy ke Server
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: self-hosted
+
+    steps:
+    - name: Ambil Kode Terbaru
+      uses: actions/checkout@v3
+
+    - name: Build dan Restart Docker
+      run: |
+        cd ${{ secrets.SERVER_PATH }}
+        git config --global --add safe.directory '*'
+        git pull origin main
+        git lfs pull || true
+        docker compose down
+        docker compose up -d --build
