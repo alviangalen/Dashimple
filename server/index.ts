@@ -42,6 +42,47 @@ export interface ServerData {
 let latestData: ServerData | null = null;
 let staticInfo: { os: string; hostname: string; processor: string; processorCores: number; ramTotal: number } | null = null;
 
+// Track network throughput over time
+let prevNetworkTime = 0;
+let prevRxBytes = 0;
+let prevTxBytes = 0;
+let lastCalculatedRxRate = 0;
+let lastCalculatedTxRate = 0;
+
+function readProcNetDev() {
+  const paths = ['/host/proc/net/dev', '/proc/net/dev'];
+  for (const p of paths) {
+    if (fs.existsSync(p)) {
+      try {
+        const content = fs.readFileSync(p, 'utf8');
+        const lines = content.split('\n');
+        let totalRx = 0;
+        let totalTx = 0;
+
+        for (let i = 2; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (!line) continue;
+          const colonIdx = line.indexOf(':');
+          if (colonIdx === -1) continue;
+
+          const iface = line.slice(0, colonIdx).trim();
+          if (iface === 'lo') continue;
+
+          const stats = line.slice(colonIdx + 1).trim().split(/\s+/);
+          const rx = parseInt(stats[0], 10) || 0;
+          const tx = parseInt(stats[8], 10) || 0;
+
+          totalRx += rx;
+          totalTx += tx;
+        }
+
+        return { totalRx, totalTx };
+      } catch {}
+    }
+  }
+  return null;
+}
+
 // Read Host OS information even inside Docker container
 function getHostOS(): string | null {
   try {
@@ -119,23 +160,49 @@ async function getStaticInfo() {
   return staticInfo;
 }
 
+// Helper to stat a mountpoint with host volume fallbacks
+function statMountpoint(mount: string): { total: number; used: number } | null {
+  if (!mount || mount.startsWith('[SWAP]')) return null;
+
+  const candidatePaths = [
+    `/host/rootfs${mount}`,
+    `/host/mnt${mount.replace(/^\/mnt/, '')}`,
+    `/host${mount}`,
+    mount,
+  ];
+
+  for (const p of candidatePaths) {
+    if (fs.existsSync(p)) {
+      try {
+        const stats = fs.statfsSync(p);
+        const total = stats.blocks * stats.bsize;
+        const free = stats.bfree * stats.bsize;
+        const used = Math.max(0, total - free);
+        if (total > 0) {
+          return { total, used };
+        }
+      } catch {}
+    }
+  }
+  return null;
+}
+
 async function getPhysicalDisks(fsSize: any[], diskLayout: any[]): Promise<DiskData[]> {
   const diskResults: DiskData[] = [];
 
-  // Filter out container internal file mounts and virtual filesystems
-  const IGNORED_PATH_PREFIXES = ['/proc', '/sys', '/dev', '/run', '/etc', '/var/lib/docker', '/containerd', '/mnt/wslg', '/host/etc', '/host/proc', '/host/sys'];
+  const IGNORED_PATH_PREFIXES = ['/proc', '/sys', '/dev', '/run', '/etc', '/var/lib/docker', '/containerd', '/mnt/wslg', '/host/etc', '/host/proc', '/host/sys', '/host/dev'];
   const validFs = (fsSize || []).filter(f => {
     if (!f.size || f.size <= 0) return false;
     const m = (f.mount || '').toLowerCase();
     if (IGNORED_PATH_PREFIXES.some(p => m.startsWith(p))) return false;
-    if (['tmpfs', 'devtmpfs', 'squashfs', 'ramfs', 'overlay'].includes(f.type) && m !== '/') return false;
+    if (['tmpfs', 'devtmpfs', 'squashfs', 'ramfs'].includes(f.type)) return false;
     if (m.endsWith('.conf') || m.endsWith('.txt') || m.endsWith('.json') || m.endsWith('.doc')) return false;
     return true;
   });
 
-  // Method 1: Try lsblk (native Linux block devices and partitions)
+  // 1. Try lsblk first (most accurate on Linux)
   try {
-    const lsblkRaw = execSync('lsblk -J -b -o NAME,SIZE,TYPE,MOUNTPOINT,FSTYPE,MODEL,VENDOR,LABEL 2>/dev/null', { timeout: 3000 }).toString();
+    const lsblkRaw = execSync('lsblk -J -b -o NAME,SIZE,TYPE,MOUNTPOINT,MOUNTPOINTS,FSTYPE,MODEL,VENDOR,LABEL 2>/dev/null', { timeout: 3000 }).toString();
     const lsblkData = JSON.parse(lsblkRaw);
 
     if (lsblkData && Array.isArray(lsblkData.blockdevices)) {
@@ -165,26 +232,31 @@ async function getPhysicalDisks(fsSize: any[], diskLayout: any[]): Promise<DiskD
         const mounts: string[] = [];
 
         function processDevice(dev: any) {
-          const m = dev.mountpoint || dev.mount;
-          if (m && !mounts.includes(m) && !m.startsWith('[SWAP]') && !IGNORED_PATH_PREFIXES.some(p => m.startsWith(p))) {
-            mounts.push(m);
+          const rawMounts: string[] = [];
+          if (dev.mountpoint) rawMounts.push(dev.mountpoint);
+          if (Array.isArray(dev.mountpoints)) {
+            for (const mp of dev.mountpoints) {
+              if (mp && typeof mp === 'string') rawMounts.push(mp);
+            }
           }
 
-          // Match used bytes from validFs
-          const devName = dev.name;
-          const matchFs = validFs.find(f => {
-            const rawFs = (f.fs || '').replace('/dev/', '');
-            return rawFs === devName || f.mount === m;
-          });
+          for (const m of rawMounts) {
+            if (m && !mounts.includes(m) && !m.startsWith('[SWAP]') && !IGNORED_PATH_PREFIXES.some(p => m.startsWith(p))) {
+              mounts.push(m);
+            }
 
-          if (matchFs && matchFs.used) {
-            usedBytes += matchFs.used;
-          } else if (m && fs.existsSync(m)) {
-            try {
-              const stat = fs.statfsSync(m);
-              const u = (stat.blocks - stat.bfree) * stat.bsize;
-              if (u > 0) usedBytes += u;
-            } catch {}
+            // Stat the mount point
+            const stat = statMountpoint(m);
+            if (stat && stat.used > 0) {
+              usedBytes += stat.used;
+            } else {
+              // Fallback match from validFs
+              const devName = dev.name;
+              const matchFs = validFs.find(f => (f.fs || '').replace('/dev/', '') === devName || f.mount === m);
+              if (matchFs && matchFs.used) {
+                usedBytes += matchFs.used;
+              }
+            }
           }
 
           if (Array.isArray(dev.children)) {
@@ -211,7 +283,7 @@ async function getPhysicalDisks(fsSize: any[], diskLayout: any[]): Promise<DiskD
     }
   } catch {}
 
-  // Method 2: Fallback to systeminformation blockDevices if lsblk failed
+  // 2. Fallback to systeminformation blockDevices
   if (diskResults.length === 0) {
     try {
       const blockDevices = await si.blockDevices().catch(() => []);
@@ -231,18 +303,18 @@ async function getPhysicalDisks(fsSize: any[], diskLayout: any[]): Promise<DiskD
         let usedBytes = 0;
         const mounts: string[] = [];
 
-        for (const f of validFs) {
-          const rawFs = (f.fs || '').replace('/dev/', '');
-          if (rawFs === diskName || rawFs.startsWith(diskName)) {
-            usedBytes += f.used || 0;
-            if (f.mount && !mounts.includes(f.mount)) mounts.push(f.mount);
-          }
-        }
-
-        const parts = (blockDevices || []).filter(b => b.name.startsWith(diskName) && b.name !== diskName);
+        const parts = (blockDevices || []).filter(b => b.name.startsWith(diskName));
         for (const p of parts) {
-          if (p.mount && !mounts.includes(p.mount) && !p.mount.startsWith('[SWAP]')) {
-            mounts.push(p.mount);
+          const m = p.mount;
+          if (m && !mounts.includes(m) && !m.startsWith('[SWAP]') && !IGNORED_PATH_PREFIXES.some(prefix => m.startsWith(prefix))) {
+            mounts.push(m);
+            const stat = statMountpoint(m);
+            if (stat && stat.used > 0) {
+              usedBytes += stat.used;
+            } else {
+              const matchFs = validFs.find(f => (f.fs || '').replace('/dev/', '') === p.name || f.mount === m);
+              if (matchFs && matchFs.used) usedBytes += matchFs.used;
+            }
           }
         }
 
@@ -261,7 +333,7 @@ async function getPhysicalDisks(fsSize: any[], diskLayout: any[]): Promise<DiskD
     } catch {}
   }
 
-  // Method 3: Fallback if physical disks still empty: use filtered validFs deduplicated
+  // 3. Fallback if physical disks still empty: use filtered validFs deduplicated
   if (diskResults.length === 0) {
     const seenDevs = new Set<string>();
     for (const f of validFs) {
@@ -288,6 +360,7 @@ async function getPhysicalDisks(fsSize: any[], diskLayout: any[]): Promise<DiskD
 
 async function collectMetrics(): Promise<ServerData> {
   const info = await getStaticInfo();
+  const now = Date.now();
 
   const [currentLoad, mem, diskLayout, fsSize, netStats, timeInfo] = await Promise.all([
     si.currentLoad().catch(() => ({ currentLoad: 0 })),
@@ -310,27 +383,56 @@ async function collectMetrics(): Promise<ServerData> {
   // Disks
   const diskResults = await getPhysicalDisks(fsSize, diskLayout);
 
-  // Network
-  let rxSecTotal = 0;
-  let txSecTotal = 0;
-  let rxBytesTotal = 0;
-  let txBytesTotal = 0;
+  // Network calculation (read kernel stats directly from /proc/net/dev)
+  const procNet = readProcNetDev();
+  let rxMBs = 0;
+  let txMBs = 0;
+  let rxTotalGB = 0;
+  let txTotalGB = 0;
 
-  if (Array.isArray(netStats) && netStats.length > 0) {
+  if (procNet) {
+    rxTotalGB = Math.round((procNet.totalRx / (1024 * 1024 * 1024)) * 1000) / 1000;
+    txTotalGB = Math.round((procNet.totalTx / (1024 * 1024 * 1024)) * 1000) / 1000;
+
+    if (prevNetworkTime > 0) {
+      const deltaSec = (now - prevNetworkTime) / 1000;
+      if (deltaSec > 0.5) {
+        const deltaRx = Math.max(0, procNet.totalRx - prevRxBytes);
+        const deltaTx = Math.max(0, procNet.totalTx - prevTxBytes);
+        rxMBs = Math.round((deltaRx / (1024 * 1024) / deltaSec) * 100) / 100;
+        txMBs = Math.round((deltaTx / (1024 * 1024) / deltaSec) * 100) / 100;
+        lastCalculatedRxRate = rxMBs;
+        lastCalculatedTxRate = txMBs;
+      } else {
+        rxMBs = lastCalculatedRxRate;
+        txMBs = lastCalculatedTxRate;
+      }
+    }
+
+    prevNetworkTime = now;
+    prevRxBytes = procNet.totalRx;
+    prevTxBytes = procNet.totalTx;
+  } else if (Array.isArray(netStats) && netStats.length > 0) {
+    // Fallback if procNet is unavailable
+    let rxSecTotal = 0;
+    let txSecTotal = 0;
+    let rxBytesTotal = 0;
+    let txBytesTotal = 0;
+
     for (const iface of netStats) {
-      if (iface.operstate === 'up' || (iface.rx_sec || 0) > 0 || (iface.tx_sec || 0) > 0 || (iface.rx_bytes || 0) > 0) {
+      if (iface.iface !== 'lo' && (iface.operstate === 'up' || (iface.rx_sec || 0) > 0 || (iface.tx_sec || 0) > 0 || (iface.rx_bytes || 0) > 0)) {
         rxSecTotal += Math.max(0, iface.rx_sec || 0);
         txSecTotal += Math.max(0, iface.tx_sec || 0);
         rxBytesTotal += Math.max(0, iface.rx_bytes || 0);
         txBytesTotal += Math.max(0, iface.tx_bytes || 0);
       }
     }
-  }
 
-  const rx = Math.round((rxSecTotal / (1024 * 1024)) * 100) / 100;
-  const tx = Math.round((txSecTotal / (1024 * 1024)) * 100) / 100;
-  const rxTotal = Math.round((rxBytesTotal / (1024 * 1024 * 1024)) * 1000) / 1000;
-  const txTotal = Math.round((txBytesTotal / (1024 * 1024 * 1024)) * 1000) / 1000;
+    rxMBs = Math.round((rxSecTotal / (1024 * 1024)) * 100) / 100;
+    txMBs = Math.round((txSecTotal / (1024 * 1024)) * 100) / 100;
+    rxTotalGB = Math.round((rxBytesTotal / (1024 * 1024 * 1024)) * 1000) / 1000;
+    txTotalGB = Math.round((txBytesTotal / (1024 * 1024 * 1024)) * 1000) / 1000;
+  }
 
   // Docker
   let dockerData = {
@@ -382,9 +484,7 @@ async function collectMetrics(): Promise<ServerData> {
         containers: mappedContainers,
       };
     }
-  } catch {
-    // Docker daemon not active
-  }
+  } catch {}
 
   const result: ServerData = {
     os: info.os,
@@ -398,10 +498,10 @@ async function collectMetrics(): Promise<ServerData> {
     ramUsed,
     disks: diskResults.length > 0 ? diskResults : [{ name: '/dev/sda', model: 'Storage Disk', mountpoint: '/', total: 100, used: 20, percent: 20 }],
     network: {
-      rx,
-      tx,
-      rxTotal,
-      txTotal,
+      rx: rxMBs,
+      tx: txMBs,
+      rxTotal: rxTotalGB,
+      txTotal: txTotalGB,
     },
     docker: dockerData,
   };

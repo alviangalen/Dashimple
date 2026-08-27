@@ -3,8 +3,7 @@ services:
     build: .
     container_name: dashimple
     restart: unless-stopped
-    ports:
-      - "1945:1945"
+    network_mode: host
     environment:
       - PORT=1945
       - NODE_ENV=production
@@ -15,4 +14,5 @@ services:
       - /dev:/dev:ro
       - /etc/os-release:/host/etc/os-release:ro
       - /etc/hostname:/host/etc/hostname:ro
+      - /:/host/rootfs:ro
     pid: host
