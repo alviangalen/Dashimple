@@ -9,7 +9,9 @@ services:
       - PORT=1945
       - NODE_ENV=production
     volumes:
-      # Akses Docker daemon host untuk monitoring container real-time
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    # Izinkan container membaca metrik proses host (opsional untuk Linux server)
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /etc/os-release:/host/etc/os-release:ro
+      - /etc/hostname:/host/etc/hostname:ro
     pid: host

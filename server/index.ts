@@ -9,6 +9,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const DIST_DIR = path.resolve(__dirname, '../dist');
 
+export interface DiskData {
+  name: string;
+  model: string;
+  mountpoint: string;
+  total: number;
+  used: number;
+  percent: number;
+}
+
 export interface ServerData {
   os: string;
   hostname: string;
@@ -19,7 +28,7 @@ export interface ServerData {
   cpu: number;
   ram: number;
   ramUsed: number;
-  disks: { name: string; mountpoint: string; total: number; used: number; percent: number }[];
+  disks: DiskData[];
   network: { rx: number; tx: number; rxTotal: number; txTotal: number };
   docker: {
     running: number;
@@ -32,6 +41,39 @@ export interface ServerData {
 let latestData: ServerData | null = null;
 let staticInfo: { os: string; hostname: string; processor: string; processorCores: number; ramTotal: number } | null = null;
 
+// Read Host OS information even inside Docker container
+function getHostOS(): string | null {
+  try {
+    const paths = ['/host/etc/os-release', '/etc/os-release'];
+    for (const p of paths) {
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf8');
+        const match = content.match(/^PRETTY_NAME="?([^"\n]+)"?/m);
+        if (match && match[1]) {
+          return match[1].trim();
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
+// Read Host Hostname even inside Docker container
+function getHostHostname(): string | null {
+  try {
+    const paths = ['/host/etc/hostname', '/etc/host_hostname'];
+    for (const p of paths) {
+      if (fs.existsSync(p)) {
+        const content = fs.readFileSync(p, 'utf8').trim();
+        if (content && !content.startsWith('58b5') && content.length < 64) {
+          return content;
+        }
+      }
+    }
+  } catch {}
+  return null;
+}
+
 async function getStaticInfo() {
   if (staticInfo) return staticInfo;
   try {
@@ -41,17 +83,24 @@ async function getStaticInfo() {
       si.mem(),
     ]);
 
-    const distro = osInfo.distro && osInfo.distro !== 'unknown' ? osInfo.distro : osInfo.platform;
-    const release = osInfo.release || '';
-    const osString = `${distro} ${release}`.trim() || 'Linux';
+    const hostOS = getHostOS();
+    const hostHostname = getHostHostname();
 
+    let osString = hostOS;
+    if (!osString) {
+      const distro = osInfo.distro && osInfo.distro !== 'unknown' ? osInfo.distro : osInfo.platform;
+      const release = osInfo.release || '';
+      osString = `${distro} ${release}`.trim() || 'Linux';
+    }
+
+    const hostname = hostHostname || osInfo.hostname || 'localhost';
     const processor = [cpu.manufacturer, cpu.brand].filter(Boolean).join(' ') || 'Standard CPU';
     const processorCores = cpu.cores || cpu.physicalCores || 1;
     const ramTotal = Math.round((mem.total / (1024 * 1024 * 1024)) * 10) / 10;
 
     staticInfo = {
       os: osString,
-      hostname: osInfo.hostname || 'localhost',
+      hostname,
       processor,
       processorCores,
       ramTotal,
@@ -72,9 +121,11 @@ async function getStaticInfo() {
 async function collectMetrics(): Promise<ServerData> {
   const info = await getStaticInfo();
 
-  const [currentLoad, mem, fsSize, netStats, timeInfo] = await Promise.all([
+  const [currentLoad, mem, blockDevices, diskLayout, fsSize, netStats, timeInfo] = await Promise.all([
     si.currentLoad().catch(() => ({ currentLoad: 0 })),
     si.mem().catch(() => ({ total: 1, active: 0, used: 0, buffcache: 0 })),
+    si.blockDevices().catch(() => []),
+    si.diskLayout().catch(() => []),
     si.fsSize().catch(() => []),
     si.networkStats().catch(() => []),
     si.time(),
@@ -89,35 +140,102 @@ async function collectMetrics(): Promise<ServerData> {
   const ramUsed = Math.round((activeMem / (1024 * 1024 * 1024)) * 100) / 100;
   const ram = Math.max(0, Math.min(100, Math.round((activeMem / (mem.total || 1)) * 1000) / 10));
 
-  // Disks
-  const filteredDisks = fsSize.filter(d => {
-    if (!d.size || d.size <= 0) return false;
-    const m = d.mount.toLowerCase();
-    if (m.startsWith('/sys') || m.startsWith('/proc') || m.startsWith('/dev') || m.startsWith('/run')) return false;
-    if (m.startsWith('/usr/lib') || m.startsWith('/mnt/wslg') || m.includes('docker/overlay') || m.includes('containerd')) return false;
-    if (d.type === 'tmpfs' || d.type === 'devtmpfs' || d.type === 'squashfs') return false;
+  // --- Disks (Physical Disks Aggregation & Filtering) ---
+  const IGNORED_PREFIXES = ['/proc', '/sys', '/dev', '/run', '/etc/', '/var/lib/docker', '/containerd', '/mnt/wslg'];
+  const IGNORED_TYPES = ['tmpfs', 'devtmpfs', 'squashfs', 'ramfs'];
+
+  const validFs = fsSize.filter(f => {
+    if (!f.size || f.size <= 0) return false;
+    const m = (f.mount || '').toLowerCase();
+    if (IGNORED_PREFIXES.some(p => m.startsWith(p))) return false;
+    if (IGNORED_TYPES.includes(f.type)) return false;
+    // Filter out file-level mounts
+    if (m.endsWith('.conf') || m.endsWith('.txt') || m.endsWith('.json') || m.endsWith('.doc')) return false;
     return true;
   });
 
-  const diskList = filteredDisks.length > 0 ? filteredDisks : fsSize.filter(d => d.size > 0);
-  const disks = diskList.map(d => {
-    let name = d.fs.replace('/dev/', '');
-    if (d.mount === '/') {
-      name = 'root';
-    } else if (d.mount.startsWith('/mnt/') && d.mount.length === 6) {
-      name = `${d.mount.slice(5).toUpperCase()}:`;
-    }
-    const total = Math.round((d.size / (1024 * 1024 * 1024)) * 10) / 10;
-    const used = Math.round((d.used / (1024 * 1024 * 1024)) * 10) / 10;
-    const percent = Math.round((d.use || (total > 0 ? (used / total) * 100 : 0)) * 10) / 10;
-    return {
-      name,
-      mountpoint: d.mount,
-      total,
-      used,
-      percent,
-    };
+  const physicalDisks = blockDevices.filter(b => {
+    if (b.type !== 'disk') return false;
+    const name = b.name.toLowerCase();
+    if (name.startsWith('ram') || name.startsWith('loop') || name.startsWith('zram') || name.startsWith('dm-')) return false;
+    return (b.size || 0) > 10 * 1024 * 1024; // > 10MB
   });
+
+  const diskResults: DiskData[] = [];
+
+  if (physicalDisks.length > 0) {
+    for (const disk of physicalDisks) {
+      const diskName = disk.name; // e.g. 'sda', 'sdb', 'nvme0n1'
+      const layout = diskLayout.find(l => {
+        const dev = l.device ? l.device.replace('/dev/', '') : '';
+        return dev === diskName || l.name === disk.model;
+      });
+
+      const modelName = [layout?.vendor || disk.vendor, layout?.name || disk.model]
+        .filter(Boolean)
+        .join(' ')
+        .trim() || disk.label || `Disk /dev/${diskName}`;
+
+      const totalBytes = disk.size || layout?.size || 0;
+      const totalGB = Math.round((totalBytes / (1024 * 1024 * 1024)) * 10) / 10;
+
+      let usedBytes = 0;
+      const mounts: string[] = [];
+
+      for (const f of validFs) {
+        const rawFs = f.fs.replace('/dev/', '');
+        if (rawFs === diskName || rawFs.startsWith(diskName)) {
+          usedBytes += f.used || 0;
+          if (f.mount && !mounts.includes(f.mount)) {
+            mounts.push(f.mount);
+          }
+        }
+      }
+
+      // Check partition mounts from blockDevices
+      const parts = blockDevices.filter(b => b.name.startsWith(diskName) && b.name !== diskName);
+      for (const p of parts) {
+        if (p.mount && !mounts.includes(p.mount) && !p.mount.startsWith('[SWAP]')) {
+          mounts.push(p.mount);
+        }
+      }
+
+      const usedGB = Math.round((usedBytes / (1024 * 1024 * 1024)) * 10) / 10;
+      const percent = totalGB > 0 ? Math.min(100, Math.round((usedGB / totalGB) * 1000) / 10) : 0;
+
+      diskResults.push({
+        name: `/dev/${diskName}`,
+        model: modelName,
+        mountpoint: mounts.length > 0 ? mounts.join(', ') : (disk.mount || 'Storage Pool / Unmounted'),
+        total: totalGB,
+        used: usedGB,
+        percent,
+      });
+    }
+  }
+
+  // Fallback if physical disks not accessible directly in container
+  if (diskResults.length === 0) {
+    const seenDevs = new Set<string>();
+    for (const f of validFs) {
+      if (seenDevs.has(f.fs) && seenDevs.has(f.mount)) continue;
+      seenDevs.add(f.fs);
+
+      const rawName = f.fs.replace('/dev/', '');
+      const totalGB = Math.round((f.size / (1024 * 1024 * 1024)) * 10) / 10;
+      const usedGB = Math.round((f.used / (1024 * 1024 * 1024)) * 10) / 10;
+      const percent = Math.round((f.use || (totalGB > 0 ? (usedGB / totalGB) * 100 : 0)) * 10) / 10;
+
+      diskResults.push({
+        name: f.fs,
+        model: `Disk Volume (${rawName || f.mount})`,
+        mountpoint: f.mount,
+        total: totalGB,
+        used: usedGB,
+        percent,
+      });
+    }
+  }
 
   // Network
   let rxSecTotal = 0;
@@ -205,7 +323,7 @@ async function collectMetrics(): Promise<ServerData> {
     cpu,
     ram,
     ramUsed,
-    disks: disks.length > 0 ? disks : [{ name: 'root', mountpoint: '/', total: 50, used: 20, percent: 40 }],
+    disks: diskResults.length > 0 ? diskResults : [{ name: '/dev/sda', model: 'Storage Disk', mountpoint: '/', total: 100, used: 20, percent: 20 }],
     network: {
       rx,
       tx,
@@ -276,7 +394,7 @@ const server = http.createServer(async (req, res) => {
     if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
       const ext = path.extname(filePath).toLowerCase();
       const contentType = MIME_TYPES[ext] || 'application/octet-stream';
-      res.writeHead(200, { 'Content-Type': contentType });
+      res.writeHead(200, { 'Content-Type': contentType })
       fs.createReadStream(filePath).pipe(res);
       return;
     }

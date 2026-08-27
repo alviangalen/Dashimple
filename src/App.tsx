@@ -1,6 +1,15 @@
 import { useState, useEffect, useRef } from "react";
 
 // --- Types ---
+export interface DiskData {
+  name: string;
+  model: string;
+  mountpoint: string;
+  total: number;
+  used: number;
+  percent: number;
+}
+
 export interface ServerData {
   os: string;
   hostname: string;
@@ -11,7 +20,7 @@ export interface ServerData {
   cpu: number;
   ram: number;
   ramUsed: number;
-  disks: { name: string; mountpoint: string; total: number; used: number; percent: number }[];
+  disks: DiskData[];
   network: { rx: number; tx: number; rxTotal: number; txTotal: number };
   docker: {
     running: number;
@@ -48,7 +57,7 @@ function formatUptime(seconds: number) {
 
 function formatBytes(gb: number) {
   if (gb >= 1000) return `${(gb / 1000).toFixed(1)} TB`;
-  return `${gb} GB`;
+  return `${gb.toFixed(1)} GB`;
 }
 
 // --- Sparkline chart ---
@@ -244,7 +253,7 @@ export default function App() {
 
     function connectWebSocket() {
       if (isUnmounted) return;
-      
+
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${protocol}//${window.location.host}/ws`;
 
@@ -417,19 +426,28 @@ export default function App() {
           <div className="mb-2 flex items-center gap-3">
             <Label>Disk Usage</Label>
             <span className="font-mono text-[10px]" style={{ color: "#444444" }}>
-              — {data.disks.length} {data.disks.length === 1 ? "volume" : "volumes"}
+              — {data.disks.length} {data.disks.length === 1 ? "physical disk" : "physical disks"}
             </span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             {data.disks.map(disk => {
               const diskColor = disk.percent >= 85 ? "#ef4444" : disk.percent >= 70 ? "#eab308" : "#f97316";
               return (
-                <Card key={disk.mountpoint} className="flex flex-col gap-3">
-                  <div className="flex items-center justify-between">
-                    <Label>{disk.mountpoint}</Label>
-                    <span className="font-mono text-[10px]" style={{ color: "#444444" }}>
-                      {disk.name}
-                    </span>
+                <Card key={disk.name} className="flex flex-col gap-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="font-mono text-sm font-medium text-[#e2e2e2] flex items-center gap-2">
+                        <span>{disk.name}</span>
+                        {disk.mountpoint && disk.mountpoint !== "Storage Pool / Unmounted" && (
+                          <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-[#1c1c1c] text-[#888888] truncate max-w-[120px]" title={disk.mountpoint}>
+                            {disk.mountpoint}
+                          </span>
+                        )}
+                      </div>
+                      <div className="font-mono text-[11px] text-[#555555] truncate mt-0.5" title={disk.model}>
+                        {disk.model}
+                      </div>
+                    </div>
                   </div>
                   <div className="flex items-baseline gap-1">
                     <span className="font-mono text-2xl font-medium" style={{ color: diskColor }}>
