@@ -17,6 +17,9 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=1945
 
+# Install util-linux for lsblk support inside container
+RUN apk add --no-cache util-linux
+
 COPY package*.json ./
 RUN npm install --omit=dev && npm install -g tsx
 
